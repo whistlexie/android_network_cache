@@ -56,23 +56,6 @@ AsyncHttpClient 会把 cookies 保存在 SharePerference 做持久化保存。
 
 
 
-```java
-String content = buildRequestContent(map); //构建 json 字符串
-String token = getKugouToken(content);// MD5 加密方法如下
-
-
-    @NonNull
-    private static String getKugouToken(String content) {
-        long timeSeconds = System.currentTimeMillis() / 1000; //系统时间
-        // java 内部的 MD5  加密
-        String md5 = MD5Utils.getMd5(content + API_KUGOU_SECRET + timeSeconds);
-        String hexTimeSeconds = Long.toHexString(timeSeconds);
-        return md5 + hexTimeSeconds;
-    }
-```
-
-
-
 简单看了一下繁星这边使用的 asynchttpclient 是1.4.6版本的，目前 asynchttpclient 最新的是 1.4.9，查看了一下网络层的封装，这边封装的也不严重，所以如果考虑替换网络框架的话，从技术成本考虑，代价不是很大。例如以下是一段网络请求代码：
 
 ```java
@@ -92,8 +75,6 @@ HttpUtil.post(context, FxConstant.getKugouBiReportUrl(), se, CONTENT_TYPE, new A
     }
 });
 ```
-
-
 
 
 

@@ -8,7 +8,7 @@
 
 
 
-### 网络框架http缓存的一般实现
+### Volley http缓存的实现
 
 这里拿 Volley 为例子，开展开来，进行说明，从特殊到一般，然后进行原理分析。
 
@@ -955,6 +955,7 @@ public void run() {
                 continue;
             }
             request.addMarker("cache-hit");
+          // 使用缓存构建 Response 
             Response<?> response = request.parseNetworkResponse(
                     new NetworkResponse(entry.data, entry.responseHeaders));
             request.addMarker("cache-hit-parsed");
@@ -990,8 +991,6 @@ public void run() {
     }
 }
 ```
-
-
 
 
 
@@ -1040,7 +1039,149 @@ if (header.getKey() != null) {
 
 所以上面的代码是把一个完整的 http 响应报文进行了缓存，这里看不到部分源码，所以没办法进行更细致的解释。
 
+实际上，我们可以有更详细的解释，我们进入其中一个 Request 的代码，例如 StringRequest  中可以找到解析 Response 的方法，然后找到解析 Header 的方法，如下：
+
+```java
+public static Cache.Entry parseCacheHeaders(NetworkResponse response) {
+    long now = System.currentTimeMillis();
+
+    Map<String, String> headers = response.headers;
+
+    long serverDate = 0;
+    long lastModified = 0;
+    long serverExpires = 0;
+    long softExpire = 0;
+    long finalExpire = 0;
+    long maxAge = 0;
+    long staleWhileRevalidate = 0;
+    boolean hasCacheControl = false;
+    boolean mustRevalidate = false;
+
+    String serverEtag = null;
+    String headerValue;
+
+    headerValue = headers.get("Date");// 获取 Header 里面的 Date 字段，服务端取值为发送该报文的时间
+    if (headerValue != null) {
+        serverDate = parseDateAsEpoch(headerValue);// 转化成 RFC1123 标准时间格式
+    }
+
+    headerValue = headers.get("Cache-Control");// 获取 Cache-Control 字段，然后解析这个字段
+    if (headerValue != null) {
+        hasCacheControl = true;
+        String[] tokens = headerValue.split(",");
+        for (int i = 0; i < tokens.length; i++) {
+            String token = tokens[i].trim();
+            if (token.equals("no-cache") || token.equals("no-store")) {
+                return null;
+            } else if (token.startsWith("max-age=")) {
+                try {
+                    maxAge = Long.parseLong(token.substring(8));
+                } catch (Exception e) {
+                }
+            } else if (token.startsWith("stale-while-revalidate=")) {
+                try {
+                    staleWhileRevalidate = Long.parseLong(token.substring(23));
+                } catch (Exception e) {
+                }
+            } else if (token.equals("must-revalidate") || token.equals("proxy-revalidate")) {
+                mustRevalidate = true;
+            }
+        }
+    }
+
+    headerValue = headers.get("Expires");
+    if (headerValue != null) {
+        serverExpires = parseDateAsEpoch(headerValue);
+    }
+
+    headerValue = headers.get("Last-Modified");
+    if (headerValue != null) {
+        lastModified = parseDateAsEpoch(headerValue);
+    }
+
+    serverEtag = headers.get("ETag");
+
+    // Cache-Control takes precedence over an Expires header, even if both exist and Expires
+    // is more restrictive.
+    if (hasCacheControl) {
+        softExpire = now + maxAge * 1000;
+        finalExpire = mustRevalidate
+                ? softExpire
+                : softExpire + staleWhileRevalidate * 1000;
+    } else if (serverDate > 0 && serverExpires >= serverDate) {
+        // Default semantic for Expire header in HTTP specification is softExpire.
+        softExpire = now + (serverExpires - serverDate);
+        finalExpire = softExpire;
+    }
+   // 这里开始便是构建一个 Cache.Entry 对象的相关代码了 
+    Cache.Entry entry = new Cache.Entry();
+    entry.data = response.data;
+    entry.etag = serverEtag;
+    entry.softTtl = softExpire;
+    entry.ttl = finalExpire;
+    entry.serverDate = serverDate;
+    entry.lastModified = lastModified;
+    entry.responseHeaders = headers;
+
+    return entry;
+}
+```
+
+从这段代码，我们可以清晰的知道，这里是如何管理 Http 缓存的，这里的代码和 Http Header 字段有关，所以需要看懂的话，需要对 Http 有比较深的理解，这里简单说一下：
+
+* cache-control 控制了缓存的约定的协议，例如是否需要缓存，缓存新鲜时间，是否需要更新等等，cache-control 字段可能存在多个值，每个值是以","分割。
+* Expires 声明了过期时间，这个字段会被 cache-control 中的 max-age 字段覆盖
+* Last-Modified 服务器声明该文件的可能的最后修改时间，效果和 ETag一样，只是没那么精确
+* ETag 对应url资源的最新消息散列，最有效的 Cache 控制字段，通常客户端会在 Request 中携带这个字段，然后服务端把最新的 ETag 和 Request 的 ETag 进行对比，如果没有更新，则返回响应体。
+
+到这里，我们应该知道 Volley 如何控制缓存了吧。如果要确实如何使用这些字段，还需要回到 CacheDispatcher 里面去看一个 Cache Request 是如何被发送的。其实在 Volley 中只是使用了 ttl 和 softTtl 两个字段来控制缓存的新鲜度，其他字段都没有使用到。至于具体的缓存新鲜度判断方式，查看上面的代码应该可以理解。
+
+实际上，ETag 才是最好的伙伴，但是这里的话，request 目测不会把 ETag 带过去请求服务器，所以这里的话，也是Volley 的优化提高点。
+
 ##### 释放缓存及施放算法
 
-如果进行缓存的自我管理，这是作为一个框架需要关心的，我们应该主动去处理这个缓存，而不是等待被处理，这样的话，我们就能更好的使用和管理缓存。
+如果进行缓存的自我管理，这是作为一个框架需要关心的，我们应该主动去处理这个缓存，而不是等待被处理，这样的话，我们就能更好的使用和管理缓存。我们可以在 DiskBasedCache 类里面找到下面这个方法：
+
+```java
+private void pruneIfNeeded(int neededSpace) {
+    if ((mTotalSize + neededSpace) < mMaxCacheSizeInBytes) {
+        return;
+    }
+    if (VolleyLog.DEBUG) {
+        VolleyLog.v("Pruning old cache entries.");
+    }
+
+    long before = mTotalSize;
+    int prunedFiles = 0;
+    long startTime = SystemClock.elapsedRealtime();
+
+    Iterator<Map.Entry<String, CacheHeader>> iterator = mEntries.entrySet().iterator();
+    while (iterator.hasNext()) {// 遍历
+        Map.Entry<String, CacheHeader> entry = iterator.next();
+        CacheHeader e = entry.getValue();
+        boolean deleted = getFileForKey(e.key).delete();
+        if (deleted) {
+            mTotalSize -= e.size;
+        } else {
+           VolleyLog.d("Could not delete cache entry for key=%s, filename=%s",
+                   e.key, getFilenameForKey(e.key));
+        }
+        iterator.remove();
+        prunedFiles++;
+       // 是否满足当前长度+需要长度< 缓存长度*0.9
+        if ((mTotalSize + neededSpace) < mMaxCacheSizeInBytes * HYSTERESIS_FACTOR) {
+            break;
+        }
+    }
+
+    if (VolleyLog.DEBUG) {
+        VolleyLog.v("pruned %d files, %d bytes, %d ms",
+                prunedFiles, (mTotalSize - before), SystemClock.elapsedRealtime() - startTime);
+    }
+}
+```
+
+这个方法，在 put() 方法里面被调用，put()方法即是每次增加缓存调用的方法，上面这个方法，在缓存空间达到上限的时候，会删除文件，由于 LinkedHashMap 的遍历顺序和插入顺序一样，所以这里会删除最早插入的缓存文件（实际上，我没有认真看这块之前，我还以为这里会使用怎样一个特殊的算法，例如fifo，lfu 什么的~~）所以，其实想优化的，Volley 这点是可以优化的。
+
+### Http缓存实现的一般方法
 
